@@ -38,7 +38,6 @@ import torch
 
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
-from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -1588,42 +1587,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend_v2()
             or self.forward_mode.is_idle()
         ):
-            # Mamba-hybrid families need the fabricated-row idle conversion
-            # below; this includes their MTP draft workers, whose mamba-less
-            # "*E" pattern makes mambaish_config return None.
-            hybrid_ssm = mambaish_config(model_runner.model_config) is not None or (
-                model_runner.is_draft_worker
-                and getattr(
-                    model_runner.model_config.hf_config,
-                    "mtp_hybrid_override_pattern",
-                    None,
-                )
-                is not None
-            )
-            if (
-                hybrid_ssm
-                and self.spec_info is not None
-                and not self.spec_info.is_draft_input()
-            ):
-                if self.forward_mode.is_idle():
-                    self._original_forward_mode = self.forward_mode
-                    self.forward_mode = ForwardMode.TARGET_VERIFY
-                # Invert the spec_scale_global_num_tokens scaling.
-                bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
-            elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
-                # empty (idle) rank. Hybrid-SSM families always take this path;
-                # non-hybrid ranks reach it once MAX_LEN is forced for the
-                # prefill breakable CUDA graph (idle + prefill), which needs
+                # empty (idle) rank. Ranks reach this once MAX_LEN is forced for
+                # the prefill breakable CUDA graph (idle + prefill), which needs
                 # every DP rank to run the same captured shape. The `else`
                 # branch handles decode rows padded to a 1-token extend.
-                if hybrid_ssm or self.seq_lens.shape[0] == 0:
+                if self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
-                    assert self.seq_lens.shape[0] == 0, (
-                        "extend-idle conversion expects an empty rank"
-                    )
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev
@@ -1652,15 +1625,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_seq_lens_cpu = [int(num_tokens)]
                     self.extend_logprob_start_lens_cpu = [0]
                     bs = self.batch_size = 1
-                    # Keep idle non-hybrid fabricated rows masked by default.
-                    # Hybrid-SSM needs the real count for its state update.
-                    mask_dummy_tokens = (
-                        not hybrid_ssm and self._original_forward_mode.is_idle()
-                    )
-                    # Bump the GLOBAL scalar; the LOCAL count is derived from it
-                    # downstream. (global_num_token_non_padded is None unless
+                    # Keep idle fabricated rows masked. Bump the GLOBAL scalar;
+                    # the LOCAL count is derived from it downstream.
+                    # (global_num_token_non_padded is None unless
                     # moe_ep_size > 1.)
-                    if mask_dummy_tokens:
+                    if self._original_forward_mode.is_idle():
                         if self.global_num_token_non_padded is not None:
                             self.global_num_token_non_padded.fill_(0)
                         self.global_num_token_non_padded_cpu = 0
